@@ -19,12 +19,12 @@ def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
     try:
-        c.execute("SELECT ATL_Time FROM scanned_symbols LIMIT 1")
-    except sqlite3.OperationalERRor:
+        c.execute("SELECT atl_time FROM scanned_symbols LIMIT 1")
+    except sqlite3.OperationalError:
         c.execute("DROP TABLE IF EXISTS scanned_symbols")
         c.execute('''CREATE TABLE scanned_symbols (
-                        symbol TEXT PRIMARY KEY, LTP REAL, atl REAL, lh1 REAL, FVG REAL, LH2 REAL, 
-                        SL REAL, RR REAL, ATL_Time TEXT, status TEXT, lh1_broken INTEGER DEFAULT 0)''')
+                        symbol TEXT PRIMARY KEY, ltp REAL, atl REAL, lh1 REAL, fvg REAL, lh2 REAL, 
+                        sl REAL, rr REAL, atl_time TEXT, status TEXT, lh1_broken INTEGER DEFAULT 0)''')
     conn.commit()
     return conn
 
@@ -43,34 +43,34 @@ def analyze_logic_main40(df, sym):
     pre_atl = df.iloc[search_start:min_idx].reset_index(drop=True)
     all_peaks = []
     for i in range(len(pre_atl) - 2, 1, -1):
-        cuRR_h = pre_atl['h'].iloc[i]
-        if cuRR_h > pre_atl['h'].iloc[i-1] and cuRR_h > pre_atl['h'].iloc[i+1]:
-            all_peaks.append(cuRR_h)
+        curr_h = pre_atl['h'].iloc[i]
+        if curr_h > pre_atl['h'].iloc[i-1] and curr_h > pre_atl['h'].iloc[i+1]:
+            all_peaks.append(curr_h)
             
     if not all_peaks: return None
     lh1 = all_peaks[0] 
-    LH2 = all_peaks[1] if len(all_peaks) > 1 else lh1 * 2
+    lh2 = all_peaks[1] if len(all_peaks) > 1 else lh1 * 2
     
     # FVG Calculation
-    FVG_entry = None
+    fvg_entry = None
     post_atl_data = df.iloc[min_idx:].reset_index(drop=True)
     for i in range(len(post_atl_data)-2):
         if post_atl_data['l'].iloc[i+2] > post_atl_data['h'].iloc[i]:
-            FVG_entry = (post_atl_data['l'].iloc[i+2] + post_atl_data['h'].iloc[i]) / 2
+            fvg_entry = (post_atl_data['l'].iloc[i+2] + post_atl_data['h'].iloc[i]) / 2
             break
-    if not FVG_entry: FVG_entry = atl_val * 1.05
+    if not fvg_entry: fvg_entry = atl_val * 1.05
     
-    SL_val = round(atl_val - (atl_val * 0.02), 1)
-    RR = round((LH2 - FVG_entry)/(FVG_entry - SL_val), 2)
-    if RR <= 4: return None
+    sl_val = round(atl_val - (atl_val * 0.02), 1)
+    rr = round((lh2 - fvg_entry)/(fvg_entry - sl_val), 2)
+    if rr <= 4: return None
 
     # NEW: Check if LH1 was broken at any point after ATL
     lh1_broken = 1 if post_atl_data['h'].max() > lh1 else 0
 
     return {
-        "LTP": round(float(df['c'].iloc[-1]), 1), "atl": round(float(atl_val), 1), 
-        "lh1": round(float(lh1), 1), "FVG": round(float(FVG_entry), 1), "LH2": round(float(LH2), 1),
-        "SL": round(float(SL_val), 1), "RR": round(float(RR), 1), "ATL_Time": atl_ts.strftime("%H:%M:%S"),
+        "ltp": round(float(df['c'].iloc[-1]), 1), "atl": round(float(atl_val), 1), 
+        "lh1": round(float(lh1), 1), "fvg": round(float(fvg_entry), 1), "lh2": round(float(lh2), 1),
+        "sl": round(float(sl_val), 1), "rr": round(float(rr), 1), "atl_time": atl_ts.strftime("%H:%M:%S"),
         "lh1_broken": lh1_broken
     }
 
@@ -92,14 +92,14 @@ def run_scanner():
                         data = analyze_logic_main40(df, sym)
                         if data:
                             worker_conn.execute("""UPDATE scanned_symbols SET 
-                                LTP=?, atl=?, lh1=?, FVG=?, LH2=?, SL=?, RR=?, ATL_Time=?, lh1_broken=?, status='FOUND' 
-                                WHERE symbol=?""", (data['LTP'], data['atl'], data['lh1'], data['FVG'], 
-                                                    data['LH2'], data['SL'], data['RR'], data['ATL_Time'], 
+                                ltp=?, atl=?, lh1=?, fvg=?, lh2=?, sl=?, rr=?, atl_time=?, lh1_broken=?, status='FOUND' 
+                                WHERE symbol=?""", (data['ltp'], data['atl'], data['lh1'], data['fvg'], 
+                                                    data['lh2'], data['sl'], data['rr'], data['atl_time'], 
                                                     data['lh1_broken'], sym))
                 worker_conn.commit()
             worker_conn.close()
         except: pass
-        time.SLeep(300)
+        time.sleep(300)
 
 # --- UI INTERFACE ---
 def main():
@@ -138,19 +138,19 @@ def main():
     
     with tab1:
         st.subheader("All Scanned Patterns")
-        full_df = pd.read_sql("SELECT symbol, LTP, atl, lh1, FVG, LH2, SL, RR, ATL_Time, lh1_broken FROM scanned_symbols WHERE status='FOUND' ORDER BY RR DESC", conn)
+        full_df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time, lh1_broken FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn)
         st.dataframe(full_df, width='stretch')
 
     with tab_watchlist:
         st.subheader("Waiting for Retracement (LH1 Broken, LTP > FVG)")
         # 26400 PE Logic: LH1 is broken, but LTP is still higher than FVG (Waiting for dip)
-        watchlist_df = full_df[(full_df['lh1_broken'] == 1) & (full_df['LTP'] > full_df['FVG'])]
+        watchlist_df = full_df[(full_df['lh1_broken'] == 1) & (full_df['ltp'] > full_df['fvg'])]
         st.dataframe(watchlist_df, width='stretch')
 
     with tab2:
         st.subheader("Active Trades (Retracement Complete, LTP near/at FVG)")
         # 26300 PE Logic: LH1 is broken, and LTP has retraced to FVG level
-        active_df = full_df[(full_df['lh1_broken'] == 1) & (full_df['LTP'] <= (full_df['FVG'] * 1.02)) & (full_df['LTP'] >= full_df['SL'])]
+        active_df = full_df[(full_df['lh1_broken'] == 1) & (full_df['ltp'] <= (full_df['fvg'] * 1.02)) & (full_df['ltp'] >= full_df['sl'])]
         st.dataframe(active_df, width='stretch')
 
     st_autorefresh(interval=60000, key="bot_refresh")
