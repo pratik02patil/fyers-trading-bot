@@ -3,3 +3,6 @@ pandas
 fyers-apiv3
 pytz
 streamlit-autorefresh
+psycopg2-binary
+SQLAlchemy
+
