@@ -18,17 +18,28 @@ DB_FILE = "trading_bot.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
-    try:
-        c.execute("SELECT atl_time FROM scanned_symbols LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("DROP TABLE IF EXISTS scanned_symbols")
-        c.execute('''CREATE TABLE scanned_symbols (
-                        symbol TEXT PRIMARY KEY, ltp REAL, atl REAL, lh1 REAL, fvg REAL, lh2 REAL, 
-                        sl REAL, rr REAL, atl_time TEXT, status TEXT)''')
+    # Scanned symbols table
+    c.execute('''CREATE TABLE IF NOT EXISTS scanned_symbols (
+                    symbol TEXT PRIMARY KEY, ltp REAL, atl REAL, lh1 REAL, fvg REAL, lh2 REAL, 
+                    sl REAL, rr REAL, atl_time TEXT, status TEXT)''')
+    # Active trades table
+    c.execute('''CREATE TABLE IF NOT EXISTS active_trades (
+                    symbol TEXT PRIMARY KEY, entry REAL, sl REAL, target REAL, 
+                    qty INTEGER, mode TEXT)''')
+    # History table
+    c.execute('''CREATE TABLE IF NOT EXISTS trade_history (
+                    symbol TEXT, entry REAL, exit REAL, result TEXT, pnl REAL, time TEXT)''')
     conn.commit()
     return conn
 
-# --- LOGIC RETAINED FROM PREVIOUS ITERATION ---
+def get_lot_size(symbol):
+    if "NIFTY" in symbol.upper():
+        return 65
+    elif "SENSEX" in symbol.upper():
+        return 20
+    return 1
+
+# --- LOGIC ---
 def analyze_logic_main40(df, sym):
     if df.empty or len(df) < 20: return None
     min_idx = df['l'].idxmin()
@@ -70,37 +81,63 @@ def analyze_logic_main40(df, sym):
         "sl": round(float(sl_val), 1), "rr": round(float(rr), 1), "atl_time": atl_ts.strftime("%H:%M:%S")
     }
 
-def run_scanner():
+def run_background_engine():
+    """Background thread to update LTP, check Watchlist entries, and manage Active Trades."""
     while True:
         try:
             worker_conn = sqlite3.connect(DB_FILE)
             if os.path.exists(TOKEN_FILE):
                 with open(TOKEN_FILE, "r") as f: token = f.read().strip()
                 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token, is_async=False)
-                symbols = pd.read_sql("SELECT symbol FROM scanned_symbols", worker_conn)['symbol'].tolist()
-                for sym in symbols:
-                    r_to = datetime.datetime.now().strftime("%Y-%m-%d")
-                    r_from = (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
-                    res = fyers.history({"symbol": sym, "resolution": "15", "date_format": "1", "range_from": r_from, "range_to": r_to, "cont_flag": "1"})
+                
+                # 1. Update Scanned Symbols LTP
+                scanned = pd.read_sql("SELECT symbol FROM scanned_symbols", worker_conn)
+                for sym in scanned['symbol']:
+                    res = fyers.quotes({"symbols": sym})
                     if res.get('s') == 'ok':
-                        df = pd.DataFrame(res['candles'], columns=['t','o','h','l','c','v'])
-                        data = analyze_logic_main40(df, sym)
-                        if data:
-                            worker_conn.execute("""UPDATE scanned_symbols SET ltp=?, atl=?, lh1=?, fvg=?, lh2=?, sl=?, rr=?, atl_time=?, status='FOUND' WHERE symbol=?""", (data['ltp'], data['atl'], data['lh1'], data['fvg'], data['lh2'], data['sl'], data['rr'], data['atl_time'], sym))
+                        ltp = res['d'][0]['v']['lp']
+                        worker_conn.execute("UPDATE scanned_symbols SET ltp=? WHERE symbol=?", (ltp, sym))
+                
+                # 2. Check Active Trades for Target/SL
+                active = pd.read_sql("SELECT * FROM active_trades", worker_conn)
+                for _, trade in active.iterrows():
+                    res = fyers.quotes({"symbols": trade['symbol']})
+                    if res.get('s') == 'ok':
+                        curr_ltp = res['d'][0]['v']['lp']
+                        result = None
+                        exit_px = 0
+                        
+                        if curr_ltp >= trade['target']:
+                            result, exit_px = "TARGET", trade['target']
+                        elif curr_ltp <= trade['sl']:
+                            result, exit_px = "SL", trade['sl']
+                        
+                        if result:
+                            pnl = (exit_px - trade['entry']) * trade['qty']
+                            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            worker_conn.execute("INSERT INTO trade_history VALUES (?,?,?,?,?,?)", 
+                                             (trade['symbol'], trade['entry'], exit_px, result, pnl, ts))
+                            worker_conn.execute("DELETE FROM active_trades WHERE symbol=?", (trade['symbol'],))
+                
                 worker_conn.commit()
             worker_conn.close()
-        except: pass
-        time.sleep(300)
+        except Exception as e:
+            print(f"Engine Error: {e}")
+        time.sleep(10) # Fast refresh for price monitoring
 
 # --- UI INTERFACE ---
 def main():
     st.set_page_config(page_title="SMC Pro Bot", layout="wide")
     conn = init_db()
+    
     if 'bg_active' not in st.session_state:
-        threading.Thread(target=run_scanner, daemon=True).start()
+        threading.Thread(target=run_background_engine, daemon=True).start()
         st.session_state['bg_active'] = True
 
+    # --- SIDEBAR ---
     st.sidebar.title("Login & Controls")
+    trade_mode = st.sidebar.radio("Trade Mode", ["Virtual", "Real Account"])
+    
     if not os.path.exists(TOKEN_FILE):
         session = fyersModel.SessionModel(client_id=CLIENT_ID, secret_key=SECRET_KEY, redirect_uri=REDIRECT_URI, response_type="code", grant_type="authorization_code")
         st.sidebar.markdown(f"[Authorize App]({session.generate_authcode()})")
@@ -111,48 +148,94 @@ def main():
             with open(TOKEN_FILE, "w") as f: f.write(res["access_token"])
             st.rerun()
     else:
-        st.sidebar.success("Fyers API Active ✅")
-        if st.sidebar.button("Fetch High RR Options", width='stretch'):
-            token = open(TOKEN_FILE, "r").read().strip()
-            fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token)
-            for idx in ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"]:
-                oc = fyers.optionchain({"symbol": idx, "strikecount": 7}) 
+        st.sidebar.success(f"Fyers Active ({trade_mode}) ✅")
+        token = open(TOKEN_FILE, "r").read().strip()
+        fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token)
+
+        # Capital Logic
+        if trade_mode == "Virtual":
+            capital = 100000.0
+        else:
+            funds = fyers.funds()
+            capital = funds['fund_limit'][0]['equityAmount'] if funds.get('s') == 'ok' else 0.0
+        
+        st.sidebar.metric("Available Capital", f"₹{capital:,.2f}")
+
+        if st.sidebar.button("Scan Market", width='stretch'):
+            for idx in ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX"]:
+                oc = fyers.optionchain({"symbol": idx, "strikecount": 5}) 
                 if oc.get('s') == 'ok':
                     for opt in oc['data']['optionsChain']:
                         sym = opt['symbol']
-                        hist = fyers.history({"symbol": sym, "resolution": "15", "date_format": "1", "range_from": (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d"), "range_to": datetime.datetime.now().strftime("%Y-%m-%d"), "cont_flag": "1"})
+                        hist = fyers.history({"symbol": sym, "resolution": "15", "date_format": "1", "range_from": (datetime.datetime.now() - datetime.timedelta(days=7)).strftime("%Y-%m-%d"), "range_to": datetime.datetime.now().strftime("%Y-%m-%d"), "cont_flag": "1"})
                         if hist.get('s') == 'ok':
                             df = pd.DataFrame(hist['candles'], columns=['t','o','h','l','c','v'])
                             data = analyze_logic_main40(df, sym)
                             if data:
-                                conn.execute("INSERT OR REPLACE INTO scanned_symbols (symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'FOUND')", (sym, data['ltp'], data['atl'], data['lh1'], data['fvg'], data['lh2'], data['sl'], data['rr'], data['atl_time']))
+                                conn.execute("INSERT OR REPLACE INTO scanned_symbols VALUES (?,?,?,?,?,?,?,?,?,?)", 
+                                           (sym, data['ltp'], data['atl'], data['lh1'], data['fvg'], data['lh2'], data['sl'], data['rr'], data['atl_time'], 'FOUND'))
             conn.commit()
 
-    # --- UPDATED TABS ---
-    tab1, tab_watchlist, tab2 = st.tabs(["📊 Live Patterns", "🔭 Watchlist", "🚀 Active Trades"])
+    # --- TABS ---
+    t1, t2, t3, t4 = st.tabs(["📊 Live Patterns", "🔭 Watchlist", "🚀 Active Trades", "📜 History"])
     
-    # 1. LIVE PATTERNS TAB
-    with tab1:
-        st.subheader("All Scanned Patterns")
-        full_df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn)
-        st.dataframe(full_df, width='stretch')
+    with t1:
+        df_all = pd.read_sql("SELECT * FROM scanned_symbols", conn)
+        st.dataframe(df_all, use_container_width=True)
 
-    # 2. WATCHLIST TAB (LH1 Break + FVG Retracement)
-    with tab_watchlist:
-        st.subheader("LH1 Break & Retracing into FVG")
-        # Filters: LTP > LH1 (Breakout) and LTP is near FVG (Retracement)
-        # We check if LTP is between SL and FVG + a small buffer for the retracement entry
-        watchlist_df = full_df[
-            (full_df['ltp'] >= full_df['lh1']) & 
-            (full_df['ltp'] <= (full_df['fvg'] * 1.01)) & 
-            (full_df['ltp'] >= full_df['sl'])
+    with t2:
+        st.subheader("Automated Execution (FVG Entry)")
+        watchlist = pd.read_sql("SELECT * FROM scanned_symbols WHERE status='FOUND'", conn)
+        
+        # Filtering logic for Watchlist
+        valid_watchlist = watchlist[
+            (watchlist['ltp'] >= watchlist['lh1']) & 
+            (watchlist['ltp'] <= (watchlist['fvg'] * 1.01)) & 
+            (watchlist['ltp'] >= watchlist['sl'])
         ]
-        if watchlist_df.empty:
-            st.info("No symbols currently breaking LH1 and retracing to FVG.")
-        else:
-            st.dataframe(watchlist_df, width='stretch')
 
-    st_autorefresh(interval=60000, key="bot_refresh")
+        if not valid_watchlist.empty:
+            st.write("The following symbols hit FVG and will be traded:")
+            for _, row in valid_watchlist.iterrows():
+                # Check if already in active trades
+                exists = conn.execute("SELECT 1 FROM active_trades WHERE symbol=?", (row['symbol'],)).fetchone()
+                if not exists:
+                    lot_size = get_lot_size(row['symbol'])
+                    qty = int((capital // row['ltp']) // lot_size) * lot_size
+                    
+                    if qty > 0:
+                        conn.execute("INSERT INTO active_trades VALUES (?,?,?,?,?,?)",
+                                   (row['symbol'], row['ltp'], row['sl'], row['lh2'], qty, trade_mode))
+                        conn.commit()
+                        st.success(f"Executed {trade_mode} trade for {row['symbol']} @ {row['ltp']}")
+            st.dataframe(valid_watchlist, use_container_width=True)
+        else:
+            st.info("Searching for LH1 Break + FVG Retracement...")
+
+    with t3:
+        st.subheader("Live P&L Tracking")
+        active_df = pd.read_sql("SELECT * FROM active_trades", conn)
+        if not active_df.empty:
+            # Join with scanned_symbols to get current LTP
+            display_active = []
+            for _, r in active_df.iterrows():
+                ltp_row = conn.execute("SELECT ltp FROM scanned_symbols WHERE symbol=?", (r['symbol'],)).fetchone()
+                ltp = ltp_row[0] if ltp_row else r['entry']
+                pnl = round((ltp - r['entry']) * r['qty'], 2)
+                display_active.append({
+                    "Symbol": r['symbol'], "LTP": ltp, "Entry": r['entry'], 
+                    "SL": r['sl'], "Target": r['target'], "Qty": r['qty'], "P&L": pnl
+                })
+            st.table(display_active)
+        else:
+            st.write("No active positions.")
+
+    with t4:
+        st.subheader("Completed Trades")
+        history_df = pd.read_sql("SELECT * FROM trade_history ORDER BY time DESC", conn)
+        st.dataframe(history_df, use_container_width=True)
+
+    st_autorefresh(interval=10000, key="ui_refresh")
     conn.close()
 
 if __name__ == "__main__": main()
