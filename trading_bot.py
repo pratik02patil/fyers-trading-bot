@@ -17,18 +17,19 @@ TOKEN_FILE = "access_token.txt"
 DB_URI = st.secrets["postgres"]["uri"] 
 
 def init_db():
+    """Initializes the PostgreSQL database with the required tables."""
     try:
         conn = psycopg2.connect(DB_URI)
         with conn.cursor() as c:
-            # 1. Scanned Symbols
+            # 1. Scanned Symbols Table
             c.execute('''CREATE TABLE IF NOT EXISTS scanned_symbols (
                             symbol TEXT PRIMARY KEY, ltp REAL, atl REAL, lh1 REAL, fvg REAL, lh2 REAL, 
                             sl REAL, rr REAL, atl_time TEXT, status TEXT)''')
-            # 2. Active Trades
+            # 2. Active Trades Table
             c.execute('''CREATE TABLE IF NOT EXISTS active_trades (
                             symbol TEXT PRIMARY KEY, entry REAL, sl REAL, target REAL, 
                             qty INTEGER, mode TEXT)''')
-            # 3. Trade History
+            # 3. Trade History Table
             c.execute('''CREATE TABLE IF NOT EXISTS trade_history (
                             symbol TEXT, entry REAL, exit REAL, result TEXT, pnl REAL, time TEXT)''')
         conn.commit()
@@ -38,12 +39,14 @@ def init_db():
         st.stop()
 
 def get_lot_size(symbol):
+    """Returns the lot size based on the symbol provided (Core logic retained)."""
     if "NIFTY" in symbol.upper(): return 65
     if "SENSEX" in symbol.upper(): return 20
     return 1
 
 # --- CORE LOGIC (UNCHANGED) ---
 def analyze_logic_main40(df, sym):
+    """Identifies trading patterns based on ATL, peaks, and FVG (Core logic retained)."""
     if df.empty or len(df) < 20: return None
     min_idx = df['l'].idxmin()
     atl_val = round(df['l'].iloc[min_idx], 2)
@@ -71,6 +74,7 @@ def analyze_logic_main40(df, sym):
             "rr": round(float(rr), 1), "atl_time": atl_ts.strftime("%H:%M:%S")}
 
 def run_background_engine():
+    """Background thread to update prices and monitor active trades."""
     while True:
         try:
             with psycopg2.connect(DB_URI) as conn:
@@ -78,7 +82,7 @@ def run_background_engine():
                     token = open(TOKEN_FILE).read().strip()
                     fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token)
                     
-                    # Update LTP
+                    # Update LTP for scanned patterns
                     with conn.cursor() as cur:
                         cur.execute("SELECT symbol FROM scanned_symbols")
                         for (sym,) in cur.fetchall():
@@ -86,7 +90,7 @@ def run_background_engine():
                             if res.get('s') == 'ok':
                                 cur.execute("UPDATE scanned_symbols SET ltp=%s WHERE symbol=%s", (res['d'][0]['v']['lp'], sym))
                     
-                    # Monitor Active Trades
+                    # Monitor Active Trades for Exit Conditions
                     active_trades = pd.read_sql("SELECT * FROM active_trades", conn)
                     for _, trade in active_trades.iterrows():
                         res = fyers.quotes({"symbols": trade['symbol']})
@@ -98,7 +102,7 @@ def run_background_engine():
                                 pnl = (exit_px - trade['entry']) * trade['qty']
                                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                 with conn.cursor() as cur:
-                                    cur.execute("INSERT INTO trade_history VALUES (%s,%s,%s,%s,%s,%s)", 
+                                    cur.execute("INSERT INTO trade_history (symbol, entry, exit, result, pnl, time) VALUES (%s,%s,%s,%s,%s,%s)", 
                                                 (trade['symbol'], trade['entry'], exit_px, result, pnl, ts))
                                     cur.execute("DELETE FROM active_trades WHERE symbol=%s", (trade['symbol'],))
                 conn.commit()
@@ -108,21 +112,28 @@ def run_background_engine():
 def main():
     st.set_page_config(page_title="SMC Pro Bot", layout="wide")
     init_db()
+    
     if 'bg_active' not in st.session_state:
         threading.Thread(target=run_background_engine, daemon=True).start()
         st.session_state['bg_active'] = True
 
-    st.sidebar.title("Controls")
-    trade_mode = st.sidebar.radio("Mode", ["Virtual", "Real"])
-    
-    # Capital Display
-    cap = 100000.0 if trade_mode == "Virtual" else 0.0 # Placeholder for API funds
-    st.sidebar.metric("Capital", f"₹{cap:,.2f}")
+    st.sidebar.title("Fyers Login & Controls")
+    trade_mode = st.sidebar.radio("Trade Mode", ["Virtual", "Real Account"])
 
+    # --- RESTORED LOGIN FUNCTIONALITY ---
     if not os.path.exists(TOKEN_FILE):
-        # ... [Fyers Authorization Logic] ...
-        pass
+        session = fyersModel.SessionModel(client_id=CLIENT_ID, secret_key=SECRET_KEY, 
+                                          redirect_uri=REDIRECT_URI, response_type="code", 
+                                          grant_type="authorization_code")
+        st.sidebar.markdown(f"[Authorize App]({session.generate_authcode()})")
+        auth_code = st.sidebar.text_input("Enter Authorization Code:")
+        if st.sidebar.button("Save Token"):
+            session.set_token(auth_code)
+            res = session.generate_token()
+            with open(TOKEN_FILE, "w") as f: f.write(res["access_token"])
+            st.rerun()
     else:
+        st.sidebar.success(f"Fyers Active ✅ ({trade_mode})")
         if st.sidebar.button("Fetch High RR Options", width='stretch'):
             token = open(TOKEN_FILE).read().strip()
             fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token)
@@ -131,44 +142,42 @@ def main():
                 if oc.get('s') == 'ok':
                     for opt in oc['data']['optionsChain']:
                         sym = opt['symbol']
-                        hist = fyers.history({"symbol": sym, "resolution": "15", "date_format": "1", "range_from": (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d"), "range_to": datetime.datetime.now().strftime("%Y-%m-%d"), "cont_flag": "1"})
+                        hist = fyers.history({"symbol": sym, "resolution": "15", "date_format": "1", 
+                                              "range_from": (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d"), 
+                                              "range_to": datetime.datetime.now().strftime("%Y-%m-%d"), "cont_flag": "1"})
                         if hist.get('s') == 'ok':
                             df = pd.DataFrame(hist['candles'], columns=['t','o','h','l','c','v'])
                             data = analyze_logic_main40(df, sym)
                             if data:
                                 with psycopg2.connect(DB_URI) as conn:
                                     with conn.cursor() as cur:
-                                        cur.execute("""INSERT INTO scanned_symbols VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'FOUND') 
+                                        cur.execute("""INSERT INTO scanned_symbols (symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time, status) 
+                                                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'FOUND') 
                                                        ON CONFLICT (symbol) DO UPDATE SET ltp=EXCLUDED.ltp, rr=EXCLUDED.rr""", 
-                                                    (sym, data['ltp'], data['atl'], data['lh1'], data['fvg'], data['lh2'], data['sl'], data['rr'], data['atl_time']))
+                                                    (sym, data['ltp'], data['atl'], data['lh1'], data['fvg'], 
+                                                     data['lh2'], data['sl'], data['rr'], data['atl_time']))
                                     conn.commit()
 
+    # --- RESTORED ALL FOUR TABS ---
     tab1, tab_watchlist, tab2, tab_history = st.tabs(["📊 Live Patterns", "🔭 Watchlist", "🚀 Active Trades", "📜 History"])
     
     with psycopg2.connect(DB_URI) as conn:
         with tab1:
-            st.dataframe(pd.read_sql("SELECT * FROM scanned_symbols", conn), use_container_width=True)
+            st.subheader("All Scanned Patterns")
+            st.dataframe(pd.read_sql("SELECT * FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn), use_container_width=True)
 
         with tab_watchlist:
-            watchlist = pd.read_sql("SELECT * FROM scanned_symbols WHERE status='FOUND'", conn)
-            valid = watchlist[(watchlist['ltp'] >= watchlist['lh1']) & (watchlist['ltp'] <= (watchlist['fvg'] * 1.01)) & (watchlist['ltp'] >= watchlist['sl'])]
-            if not valid.empty:
-                for _, r in valid.iterrows():
-                    # Logic to move to Active Trades if not already present
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT 1 FROM active_trades WHERE symbol=%s", (r['symbol'],))
-                        if not cur.fetchone():
-                            lot = get_lot_size(r['symbol'])
-                            qty = int((cap // r['ltp']) // lot) * lot
-                            if qty > 0:
-                                cur.execute("INSERT INTO active_trades VALUES (%s,%s,%s,%s,%s,%s)", (r['symbol'], r['ltp'], r['sl'], r['lh2'], qty, trade_mode))
-                conn.commit()
-                st.dataframe(valid, use_container_width=True)
+            st.subheader("LH1 Break & Retracing into FVG")
+            full_df = pd.read_sql("SELECT * FROM scanned_symbols WHERE status='FOUND'", conn)
+            valid = full_df[(full_df['ltp'] >= full_df['lh1']) & (full_df['ltp'] <= (full_df['fvg'] * 1.01)) & (full_df['ltp'] >= full_df['sl'])]
+            st.dataframe(valid, use_container_width=True)
 
         with tab2:
+            st.subheader("Currently Monitored Trades")
             st.dataframe(pd.read_sql("SELECT * FROM active_trades", conn), use_container_width=True)
 
         with tab_history:
+            st.subheader("Completed Trade Performance")
             st.dataframe(pd.read_sql("SELECT * FROM trade_history ORDER BY time DESC", conn), use_container_width=True)
 
     st_autorefresh(interval=10000, key="ui_refresh")
