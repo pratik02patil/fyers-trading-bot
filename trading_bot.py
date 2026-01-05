@@ -16,11 +16,15 @@ TOKEN_FILE = "access_token.txt"
 DB_FILE = "trading_bot.db"
 
 def init_db():
+    """Initializes and repairs the database to ensure it has exactly 10 columns."""
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
+    # Check if the existing table matches the required schema
     try:
+        # Testing for the newest column 'atl_time'
         c.execute("SELECT atl_time FROM scanned_symbols LIMIT 1")
     except sqlite3.OperationalError:
+        # If column doesn't exist, drop and recreate for a clean 10-column start
         c.execute("DROP TABLE IF EXISTS scanned_symbols")
         c.execute('''CREATE TABLE scanned_symbols (
                         symbol TEXT PRIMARY KEY, ltp REAL, atl REAL, lh1 REAL, fvg REAL, lh2 REAL, 
@@ -28,26 +32,22 @@ def init_db():
     conn.commit()
     return conn
 
-# --- EXACT LOGIC COPIED FROM MAIN40.PY ---
+# --- LOGIC & FILTERS FROM MAIN40.PY ---
 def analyze_logic_main40(df, sym):
-    # Filter 1: Candle Count
+    """Exact filters from main40.py: 30<ATL<250, Peaks, RR>4."""
     if df.empty or len(df) < 20: return None
     
-    # 1. Find ATL
+    # 1. Find ATL & Price Range (Filter: 30 < ATL < 250)
     min_idx = df['l'].idxmin()
     atl_val = round(df['l'].iloc[min_idx], 2)
-    
-    # Filter 2: Price Range (30-250)
     if not (30 < atl_val < 250): return None
-    # Filter 3: Recency
     if min_idx >= len(df) - 3: return None
 
     atl_ts = pd.to_datetime(df['t'].iloc[min_idx], unit='s') + datetime.timedelta(hours=5, minutes=30)
 
-    # --- LH1 & LH2 LOGIC ---
+    # 2. LH1 & LH2 Peaks (Filter: Historical Peak Check)
     search_start = max(0, min_idx - 300)
     pre_atl = df.iloc[search_start:min_idx].reset_index(drop=True)
-    
     if len(pre_atl) < 5: return None
     
     all_peaks = []
@@ -56,22 +56,21 @@ def analyze_logic_main40(df, sym):
         if curr_h > pre_atl['h'].iloc[i-1] and curr_h > pre_atl['h'].iloc[i+1]:
             all_peaks.append(curr_h)
             
-    # Filter 4 & 5: Peak Existence
     if not all_peaks: return None
     
     lh1 = all_peaks[0] 
     lh2 = None
+    # 1.5x Peak Fallback Logic
     for p in all_peaks[1:]:
         if p >= lh1 * 1.5:
             lh2 = p
             break
-            
     if lh2 is None and len(all_peaks) > 1:
         lh2 = all_peaks[1]
     elif lh2 is None:
         return None 
 
-    # --- FVG & SL LOGIC ---
+    # 3. FVG & SL
     fvg_entry = None
     post_atl_data = df.iloc[min_idx:].reset_index(drop=True)
     for i in range(len(post_atl_data)-2):
@@ -82,12 +81,9 @@ def analyze_logic_main40(df, sym):
     if not fvg_entry: fvg_entry = atl_val * 1.05
     sl_val = round(atl_val - (atl_val * 0.02), 1)
     
-    # Filter 7: Entry > SL
+    # 4. Final RR Check (Filter: RR > 4)
     if fvg_entry <= sl_val: return None
-    
     rr = round((lh2 - fvg_entry)/(fvg_entry - sl_val), 2)
-
-    # Filter 8: RR > 4
     if rr <= 4: return None
 
     return {
@@ -96,7 +92,7 @@ def analyze_logic_main40(df, sym):
         "sl": round(float(sl_val), 1), "rr": round(float(rr), 1), "atl_time": atl_ts.strftime("%H:%M:%S")
     }
 
-# --- BACKGROUND ENGINE ---
+# --- SCANNER ENGINE ---
 def run_scanner():
     while True:
         try:
@@ -108,6 +104,7 @@ def run_scanner():
                 symbols = pd.read_sql("SELECT symbol FROM scanned_symbols", worker_conn)['symbol'].tolist()
                 for sym in symbols:
                     r_to = datetime.datetime.now().strftime("%Y-%m-%d")
+                    # 14-day lookback as per main40.py
                     r_from = (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
                     
                     hist_data = {"symbol": sym, "resolution": "15", "date_format": "1", 
@@ -127,9 +124,9 @@ def run_scanner():
         except: pass
         time.sleep(300)
 
-# --- UI INTERFACE ---
+# --- STREAMLIT UI ---
 def main():
-    st.set_page_config(page_title="SMC ATM Bot", layout="wide")
+    st.set_page_config(page_title="SMC Pro Bot", layout="wide")
     conn = init_db()
     
     if 'bg_active' not in st.session_state:
@@ -138,33 +135,28 @@ def main():
 
     st.sidebar.title("Login & Controls")
     
-    token = ""
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r") as f: token = f.read().strip()
-
-    if not token:
+    if not os.path.exists(TOKEN_FILE):
         session = fyersModel.SessionModel(client_id=CLIENT_ID, secret_key=SECRET_KEY, 
                                           redirect_uri=REDIRECT_URI, response_type="code", grant_type="authorization_code")
-        st.sidebar.warning("Login Required")
         st.sidebar.markdown(f"[Authorize App]({session.generate_authcode()})")
         auth_code = st.sidebar.text_input("Enter Code:")
-        if st.sidebar.button("Save Access Token"):
+        if st.sidebar.button("Save Token"):
             session.set_token(auth_code)
             res = session.generate_token()
-            if "access_token" in res:
-                with open(TOKEN_FILE, "w") as f: f.write(res["access_token"])
-                st.rerun()
+            with open(TOKEN_FILE, "w") as f: f.write(res["access_token"])
+            st.rerun()
     else:
         st.sidebar.success("Fyers API Active ✅")
         
+        # High RR Seeding (15 Nifty + 15 Sensex ATM strikes)
         if st.sidebar.button("Fetch High RR Options (Nifty & Sensex)", width='stretch'):
+            token = open(TOKEN_FILE, "r").read().strip()
             fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token)
             found_count = 0
             
-            with st.spinner("Applying main40.py filters..."):
+            with st.spinner("Applying all filters..."):
                 for idx in ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"]:
-                    # Increased strikecount to 30 as per main40.py
-                    oc = fyers.optionchain({"symbol": idx, "strikecount": 30}) 
+                    oc = fyers.optionchain({"symbol": idx, "strikecount": 7}) 
                     if oc.get('s') == 'ok':
                         for opt in oc['data']['optionsChain']:
                             sym = opt['symbol']
@@ -175,6 +167,7 @@ def main():
                             if hist.get('s') == 'ok':
                                 df = pd.DataFrame(hist['candles'], columns=['t','o','h','l','c','v'])
                                 data = analyze_logic_main40(df, sym)
+                                # Only seed if RR > 4 and passes all main40.py price/peak filters
                                 if data:
                                     conn.execute("""INSERT OR REPLACE INTO scanned_symbols 
                                         (symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time, status) 
@@ -183,12 +176,11 @@ def main():
                                          data['lh2'], data['sl'], data['rr'], data['atl_time']))
                                     found_count += 1
                 conn.commit()
-                st.toast(f"Added {found_count} options matching all filters!")
+                st.toast(f"Found {found_count} matches!")
 
     tab1, tab2 = st.tabs(["📊 Live Patterns", "🚀 Active Trades"])
-    
     with tab1:
-        st.subheader("Patterns Matching main40.py Logic")
+        st.subheader("High RR Pattern Scanner")
         df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn)
         st.dataframe(df, width='stretch')
 
