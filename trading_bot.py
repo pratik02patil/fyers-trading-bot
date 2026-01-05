@@ -23,6 +23,7 @@ def init_db():
     """Initializes SQLite tables for scanner and active trades."""
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
+    # Table structure updated to match main40.py logic needs
     c.execute('''CREATE TABLE IF NOT EXISTS scanned_symbols (
                     symbol TEXT PRIMARY KEY, ltp REAL, atl REAL, lh1 REAL, lh2 REAL, 
                     fvg_low REAL, target REAL, sl REAL, rr REAL, 
@@ -38,27 +39,27 @@ def init_db():
 # ==========================================
 def analyze_smc_logic(df):
     """
-    Implements the logic from main40.py:
-    1. Finds All-Time Low (ATL).
-    2. Identifies two previous peaks (Lower Highs).
-    3. Finds a Fair Value Gap (FVG) after the ATL.
+    Implements the SMC logic from main40.py:
+    - Identifies All-Time Low (ATL)
+    - Detects two previous peaks (Lower Highs: LH1, LH2)
+    - Finds Fair Value Gap (FVG) after ATL
     """
     if df.empty or len(df) < 20: return None
     
-    # Identify ATL
+    # Identify ATL (All-Time Low)
     min_idx = df['l'].idxmin()
     atl_val = round(df['l'].iloc[min_idx], 2)
     
-    # Filter: ATL must be in a realistic range for the strategy (30-250)
-    if not (30 < atl_val < 250): return None
+    # Logic from main40.py: ATL must be in a tradeable range
+    if not (10 < atl_val < 500): return None
     if min_idx >= len(df) - 3: return None
     
-    # Identify Peaks (LH1 & LH2) before ATL
+    # Identify Peaks (LH1 & LH2) before the ATL
     df_before = df.iloc[:min_idx]
     if len(df_before) < 10: return None
     
-    # Peak detection logic: a high higher than 2 neighbors on each side
     peaks = []
+    # Peak detection: Current high is greater than 2 previous and 2 next candles
     for i in range(2, len(df_before)-2):
         if df_before['h'].iloc[i] == df_before['h'].iloc[i-2:i+3].max():
             peaks.append(df_before['h'].iloc[i])
@@ -70,14 +71,14 @@ def analyze_smc_logic(df):
     df_after = df.iloc[min_idx:]
     fvg = None
     for i in range(len(df_after) - 2):
-        # Bullish FVG: Low of candle 3 is higher than High of candle 1
+        # Bullish FVG check
         if df_after['l'].iloc[i+2] > df_after['h'].iloc[i]:
             fvg = df_after['h'].iloc[i]
             break
     
     if not fvg: return None
     
-    # Calculate Trade Parameters
+    # Trade Parameter Calculations
     sl = atl_val - (atl_val * 0.001)
     target = lh2
     rr = round((target - fvg) / (fvg - sl), 2) if (fvg - sl) != 0 else 0
@@ -85,10 +86,10 @@ def analyze_smc_logic(df):
     return {"atl": atl_val, "lh1": lh1, "lh2": lh2, "fvg": fvg, "sl": sl, "target": target, "rr": rr}
 
 # ==========================================
-# 3. BACKGROUND WORKER
+# 3. BACKGROUND WORKER (DATA UPDATER)
 # ==========================================
 def background_worker():
-    """Independent thread that updates prices and runs SMC logic."""
+    """Thread to update prices and scan for patterns every 5 minutes."""
     while True:
         try:
             worker_conn = sqlite3.connect(DB_FILE)
@@ -101,10 +102,12 @@ def background_worker():
                 scanned = pd.read_sql("SELECT symbol FROM scanned_symbols", worker_conn)
                 
                 for sym in scanned['symbol'].tolist():
-                    # Fetch 250 candles of 5-min data (similar to main40.py)
-                    hist_data = {"symbol": sym, "resolution": "5", "date_format": "1", 
-                                 "range_from": (datetime.datetime.now() - datetime.timedelta(days=15)).strftime("%Y-%m-%d"),
-                                 "range_to": datetime.datetime.now().strftime("%Y-%m-%d"), "cont_flag": "1"}
+                    # Fetch historical data (5-minute resolution)
+                    hist_data = {
+                        "symbol": sym, "resolution": "5", "date_format": "1", 
+                        "range_from": (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d"),
+                        "range_to": datetime.datetime.now().strftime("%Y-%m-%d"), "cont_flag": "1"
+                    }
                     
                     res = fyers.history(data=hist_data)
                     if res.get('s') == 'ok':
@@ -114,60 +117,67 @@ def background_worker():
                         if analysis:
                             curr_ltp = df['c'].iloc[-1]
                             worker_conn.execute("""UPDATE scanned_symbols SET 
-                                ltp=?, atl=?, lh1=?, lh2=?, fvg_low=?, target=?, sl=?, rr=?, status='PATTERN' 
+                                ltp=?, atl=?, lh1=?, lh2=?, fvg_low=?, target=?, sl=?, rr=?, status='PATTERN_DETECTED' 
                                 WHERE symbol=?""", (curr_ltp, analysis['atl'], analysis['lh1'], analysis['lh2'], 
                                                     analysis['fvg'], analysis['target'], analysis['sl'], analysis['rr'], sym))
                 worker_conn.commit()
             worker_conn.close()
-        except: pass
-        time.sleep(300) # Scan every 5 minutes
+        except Exception: pass
+        time.sleep(300)
 
 # ==========================================
 # 4. STREAMLIT UI
 # ==========================================
 def main():
-    st.set_page_config(page_title="SMC Trading Bot Cloud", layout="wide")
+    st.set_page_config(page_title="SMC Trading Bot", layout="wide")
     conn = init_db()
     
-    if 'bg_active' not in st.session_state:
+    if 'bg_task_running' not in st.session_state:
         threading.Thread(target=background_worker, daemon=True).start()
-        st.session_state['bg_active'] = True
+        st.session_state['bg_task_running'] = True
 
-    # SIDEBAR: FYERS LOGIN (KEEPING AS IS)
-    st.sidebar.title("Bot Settings")
+    # SIDEBAR: FYERS AUTHENTICATION
+    st.sidebar.title("Fyers Cloud Login")
     token = ""
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "r") as f: token = f.read().strip()
 
     if not token:
-        session = fyersModel.SessionModel(client_id=CLIENT_ID, secret_key=SECRET_KEY, redirect_uri=REDIRECT_URI, response_type="code", grant_type="authorization_code")
-        st.sidebar.info("Please Login")
-        st.sidebar.markdown(f"[Login to Fyers]({session.generate_authcode()})")
-        auth_code = st.sidebar.text_input("Enter Auth Code:")
-        if st.sidebar.button("Generate Token"):
+        session = fyersModel.SessionModel(client_id=CLIENT_ID, secret_key=SECRET_KEY, 
+                                          redirect_uri=REDIRECT_URI, response_type="code", grant_type="authorization_code")
+        st.sidebar.warning("Login Required")
+        st.sidebar.markdown(f"[Authorize App]({session.generate_authcode()})")
+        auth_code = st.sidebar.text_input("Enter the code from URL:")
+        if st.sidebar.button("Save Access Token"):
             session.set_token(auth_code)
             res = session.generate_token()
             if "access_token" in res:
                 with open(TOKEN_FILE, "w") as f: f.write(res["access_token"])
                 st.rerun()
     else:
-        st.sidebar.success("Connected ✅")
-        if st.sidebar.button("Fetch New Options", use_container_width=True):
-            # Seed symbols logic here using optionchain API...
-            st.toast("Fetching Option Chain...")
+        st.sidebar.success("Fyers API Active ✅")
+        if st.sidebar.button("Re-Scan Option Chain"):
+            # Logic to fetch new symbols via Fyers Option Chain API
+            st.toast("Refreshing symbols...")
 
-    # MAIN DASHBOARD
-    tab1, tab2 = st.tabs(["📊 SMC Scanner", "📈 Active Positions"])
+    # MAIN DASHBOARD TABS
+    tab_scan, tab_active = st.tabs(["📊 SMC Pattern Scanner", "📉 Active Trades"])
     
-    with tab1:
-        df_scan = pd.read_sql("SELECT * FROM scanned_symbols WHERE status='PATTERN' ORDER BY rr DESC", conn)
-        st.dataframe(df_scan, width=None)
+    with tab_scan:
+        st.subheader("Detected Smart Money Patterns")
+        df_scan = pd.read_sql("SELECT * FROM scanned_symbols WHERE status='PATTERN_DETECTED' ORDER BY rr DESC", conn)
+        
+        # FIXED: width="stretch" resolves the StreamlitInvalidWidthError
+        st.dataframe(df_scan, width="stretch")
 
-    with tab2:
+    with tab_active:
+        st.subheader("Current Market Positions")
         df_active = pd.read_sql("SELECT * FROM active_trades", conn)
-        st.dataframe(df_active, width=None)
+        st.dataframe(df_active, width="stretch")
 
-    st_autorefresh(interval=60000, key="ui_refresh")
+    # Refresh the UI every 60 seconds
+    st_autorefresh(interval=60000, key="global_refresh")
     conn.close()
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
