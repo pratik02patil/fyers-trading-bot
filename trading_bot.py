@@ -19,12 +19,12 @@ def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
     try:
-        c.execute("SELECT atl_time FROM scanned_symbols LIMIT 1")
-    except sqlite3.OperationalError:
+        c.execute("SELECT ATL_time FROM scanned_symbols LIMIT 1")
+    except sqlite3.OperationalERRor:
         c.execute("DROP TABLE IF EXISTS scanned_symbols")
         c.execute('''CREATE TABLE scanned_symbols (
-                        symbol TEXT PRIMARY KEY, ltp REAL, atl REAL, lh1 REAL, fvg REAL, lh2 REAL, 
-                        sl REAL, rr REAL, atl_time TEXT, status TEXT)''')
+                        symbol TEXT PRIMARY KEY, LTP REAL, ATL REAL, LH1 REAL, FVG REAL, LH2 REAL, 
+                        SL REAL, RR REAL, ATL_time TEXT, status TEXT)''')
     conn.commit()
     return conn
 
@@ -32,42 +32,42 @@ def init_db():
 def analyze_logic_main40(df, sym):
     if df.empty or len(df) < 20: return None
     min_idx = df['l'].idxmin()
-    atl_val = round(df['l'].iloc[min_idx], 2)
-    if not (30 < atl_val < 250): return None
+    ATL_val = round(df['l'].iloc[min_idx], 2)
+    if not (30 < ATL_val < 250): return None
     if min_idx >= len(df) - 3: return None
-    atl_ts = pd.to_datetime(df['t'].iloc[min_idx], unit='s') + datetime.timedelta(hours=5, minutes=30)
+    ATL_ts = pd.to_datetime(df['t'].iloc[min_idx], unit='s') + datetime.timedelta(hours=5, minutes=30)
     search_start = max(0, min_idx - 300)
-    pre_atl = df.iloc[search_start:min_idx].reset_index(drop=True)
-    if len(pre_atl) < 5: return None
+    pre_ATL = df.iloc[search_start:min_idx].reset_index(drop=True)
+    if len(pre_ATL) < 5: return None
     all_peaks = []
-    for i in range(len(pre_atl) - 2, 1, -1):
-        curr_h = pre_atl['h'].iloc[i]
-        if curr_h > pre_atl['h'].iloc[i-1] and curr_h > pre_atl['h'].iloc[i+1]:
-            all_peaks.append(curr_h)
+    for i in range(len(pre_ATL) - 2, 1, -1):
+        cuRR_h = pre_ATL['h'].iloc[i]
+        if cuRR_h > pre_ATL['h'].iloc[i-1] and cuRR_h > pre_ATL['h'].iloc[i+1]:
+            all_peaks.append(cuRR_h)
     if not all_peaks: return None
-    lh1 = all_peaks[0] 
-    lh2 = None
+    LH1 = all_peaks[0] 
+    LH2 = None
     for p in all_peaks[1:]:
-        if p >= lh1 * 1.5:
-            lh2 = p
+        if p >= LH1 * 1.5:
+            LH2 = p
             break
-    if lh2 is None and len(all_peaks) > 1: lh2 = all_peaks[1]
-    elif lh2 is None: return None 
-    fvg_entry = None
-    post_atl_data = df.iloc[min_idx:].reset_index(drop=True)
-    for i in range(len(post_atl_data)-2):
-        if post_atl_data['l'].iloc[i+2] > post_atl_data['h'].iloc[i]:
-            fvg_entry = (post_atl_data['l'].iloc[i+2] + post_atl_data['h'].iloc[i]) / 2
+    if LH2 is None and len(all_peaks) > 1: LH2 = all_peaks[1]
+    elif LH2 is None: return None 
+    FVG_entry = None
+    post_ATL_data = df.iloc[min_idx:].reset_index(drop=True)
+    for i in range(len(post_ATL_data)-2):
+        if post_ATL_data['l'].iloc[i+2] > post_ATL_data['h'].iloc[i]:
+            FVG_entry = (post_ATL_data['l'].iloc[i+2] + post_ATL_data['h'].iloc[i]) / 2
             break
-    if not fvg_entry: fvg_entry = atl_val * 1.05
-    sl_val = round(atl_val - (atl_val * 0.02), 1)
-    if fvg_entry <= sl_val: return None
-    rr = round((lh2 - fvg_entry)/(fvg_entry - sl_val), 2)
-    if rr <= 4: return None
+    if not FVG_entry: FVG_entry = ATL_val * 1.05
+    SL_val = round(ATL_val - (ATL_val * 0.02), 1)
+    if FVG_entry <= SL_val: return None
+    RR = round((LH2 - FVG_entry)/(FVG_entry - SL_val), 2)
+    if RR <= 4: return None
     return {
-        "ltp": round(float(df['c'].iloc[-1]), 1), "atl": round(float(atl_val), 1), 
-        "lh1": round(float(lh1), 1), "fvg": round(float(fvg_entry), 1), "lh2": round(float(lh2), 1),
-        "sl": round(float(sl_val), 1), "rr": round(float(rr), 1), "atl_time": atl_ts.strftime("%H:%M:%S")
+        "LTP": round(float(df['c'].iloc[-1]), 1), "ATL": round(float(ATL_val), 1), 
+        "LH1": round(float(LH1), 1), "FVG": round(float(FVG_entry), 1), "LH2": round(float(LH2), 1),
+        "SL": round(float(SL_val), 1), "RR": round(float(RR), 1), "ATL_time": ATL_ts.strftime("%H:%M:%S")
     }
 
 def run_scanner():
@@ -86,11 +86,11 @@ def run_scanner():
                         df = pd.DataFrame(res['candles'], columns=['t','o','h','l','c','v'])
                         data = analyze_logic_main40(df, sym)
                         if data:
-                            worker_conn.execute("""UPDATE scanned_symbols SET ltp=?, atl=?, lh1=?, fvg=?, lh2=?, sl=?, rr=?, atl_time=?, status='FOUND' WHERE symbol=?""", (data['ltp'], data['atl'], data['lh1'], data['fvg'], data['lh2'], data['sl'], data['rr'], data['atl_time'], sym))
+                            worker_conn.execute("""UPDATE scanned_symbols SET LTP=?, ATL=?, LH1=?, FVG=?, LH2=?, SL=?, RR=?, ATL_time=?, status='FOUND' WHERE symbol=?""", (data['LTP'], data['ATL'], data['LH1'], data['FVG'], data['LH2'], data['SL'], data['RR'], data['ATL_time'], sym))
                 worker_conn.commit()
             worker_conn.close()
         except: pass
-        time.sleep(300)
+        time.SLeep(300)
 
 # --- UI INTERFACE ---
 def main():
@@ -125,7 +125,7 @@ def main():
                             df = pd.DataFrame(hist['candles'], columns=['t','o','h','l','c','v'])
                             data = analyze_logic_main40(df, sym)
                             if data:
-                                conn.execute("INSERT OR REPLACE INTO scanned_symbols (symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'FOUND')", (sym, data['ltp'], data['atl'], data['lh1'], data['fvg'], data['lh2'], data['sl'], data['rr'], data['atl_time']))
+                                conn.execute("INSERT OR REPLACE INTO scanned_symbols (symbol, LTP, ATL, LH1, FVG, LH2, SL, RR, ATL_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'FOUND')", (sym, data['LTP'], data['ATL'], data['LH1'], data['FVG'], data['LH2'], data['SL'], data['RR'], data['ATL_time']))
             conn.commit()
 
     # --- UPDATED TABS ---
@@ -134,7 +134,7 @@ def main():
     # 1. LIVE PATTERNS TAB
     with tab1:
         st.subheader("All Scanned Patterns")
-        full_df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn)
+        full_df = pd.read_sql("SELECT symbol, LTP, ATL, LH1, FVG, LH2, SL, RR, ATL_time FROM scanned_symbols WHERE status='FOUND' ORDER BY RR DESC", conn)
         st.dataframe(full_df, width='stretch')
 
     # 2. WATCHLIST TAB (LH1 Break + FVG Retracement)
@@ -143,12 +143,12 @@ def main():
         # Filters: LTP > LH1 (Breakout) and LTP is near FVG (Retracement)
         # We check if LTP is between SL and FVG + a small buffer for the retracement entry
         watchlist_df = full_df[
-            (full_df['ltp'] >= full_df['lh1']) & 
-            (full_df['ltp'] <= (full_df['fvg'] * 1.01)) & 
-            (full_df['ltp'] >= full_df['sl'])
+            (full_df['LTP'] >= full_df['LH1']) & 
+            (full_df['LTP'] <= (full_df['FVG'] * 1.01)) & 
+            (full_df['LTP'] >= full_df['SL'])
         ]
         if watchlist_df.empty:
-            st.info("No symbols currently breaking LH1 and retracing to FVG.")
+            st.info("No symbols cuRRently breaking LH1 and retracing to FVG.")
         else:
             st.dataframe(watchlist_df, width='stretch')
 
@@ -156,3 +156,4 @@ def main():
     conn.close()
 
 if __name__ == "__main__": main()
+
