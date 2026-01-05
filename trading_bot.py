@@ -16,14 +16,11 @@ TOKEN_FILE = "access_token.txt"
 DB_FILE = "trading_bot.db"
 
 def init_db():
-    """Initializes the database and handles structural updates automatically."""
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
-    # Check if we need to recreate the table (Self-Healing)
     try:
         c.execute("SELECT atl_time FROM scanned_symbols LIMIT 1")
     except sqlite3.OperationalError:
-        # Table is old or doesn't exist, recreate it
         c.execute("DROP TABLE IF EXISTS scanned_symbols")
         c.execute('''CREATE TABLE scanned_symbols (
                         symbol TEXT PRIMARY KEY, ltp REAL, atl REAL, lh1 REAL, fvg REAL, lh2 REAL, 
@@ -35,13 +32,10 @@ def init_db():
 def analyze_logic_main40(df, sym):
     if df.empty or len(df) < 100: return None
     
-    # 1. Identify ATL and exact timestamp
     min_idx = df['l'].idxmin()
     atl_val = df['l'].iloc[min_idx]
-    # Exact IST timestamp for that specific candle
     atl_ts = pd.to_datetime(df['t'].iloc[min_idx], unit='s') + datetime.timedelta(hours=5, minutes=30)
     
-    # 2. LH1 & LH2 Peaks BEFORE ATL
     pre_atl = df.iloc[:min_idx]
     if len(pre_atl) < 15: return None
     
@@ -52,7 +46,6 @@ def analyze_logic_main40(df, sym):
     if len(peaks) < 2: return None
     lh1, lh2 = peaks[-1], peaks[-2]
     
-    # 3. FVG after ATL
     post_atl = df.iloc[min_idx:]
     fvg = None
     for i in range(len(post_atl)-2):
@@ -70,7 +63,7 @@ def analyze_logic_main40(df, sym):
         "sl": round(float(sl), 1), "rr": round(float(rr), 1), "atl_time": atl_ts.strftime("%H:%M:%S")
     }
 
-# --- BACKGROUND ENGINE (10-DAY WINDOW RESTORED) ---
+# --- BACKGROUND ENGINE ---
 def run_scanner():
     while True:
         try:
@@ -81,7 +74,6 @@ def run_scanner():
                 
                 symbols = pd.read_sql("SELECT symbol FROM scanned_symbols", worker_conn)['symbol'].tolist()
                 for sym in symbols:
-                    # 10-DAY LOOKBACK RESTORED (Ensures 750+ candles)
                     r_to = datetime.datetime.now().strftime("%Y-%m-%d")
                     r_from = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
                     
@@ -111,7 +103,6 @@ def main():
         threading.Thread(target=run_scanner, daemon=True).start()
         st.session_state['bg_active'] = True
 
-    # SIDEBAR: LOGIN & CONTROLS
     st.sidebar.title("Login & Controls")
     
     token = ""
@@ -132,23 +123,42 @@ def main():
                 st.rerun()
     else:
         st.sidebar.success("Fyers API Active ✅")
-        if st.sidebar.button("Fetch ATM Options (Nifty & Sensex)", width='stretch'):
+        
+        # --- REFINED SEEDING LOGIC: ONLY SEED IF RR > 4 ---
+        if st.sidebar.button("Fetch High RR Options (Nifty & Sensex)", width='stretch'):
             fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token)
-            # ATM +- 7 Strikes for both Indices
-            for idx in ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"]:
-                oc = fyers.optionchain({"symbol": idx, "strikecount": 7}) 
-                if oc.get('s') == 'ok':
-                    for opt in oc['data']['optionsChain']:
-                        conn.execute("INSERT OR IGNORE INTO scanned_symbols (symbol, status) VALUES (?, 'WATCHING')", (opt['symbol'],))
-            conn.commit()
-            st.toast("Seeded 30 ATM Options!")
+            found_count = 0
+            
+            with st.spinner("Scanning for High RR patterns..."):
+                for idx in ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"]:
+                    oc = fyers.optionchain({"symbol": idx, "strikecount": 7}) 
+                    if oc.get('s') == 'ok':
+                        for opt in oc['data']['optionsChain']:
+                            sym = opt['symbol']
+                            # Quick history check for seeding
+                            r_to = datetime.datetime.now().strftime("%Y-%m-%d")
+                            r_from = (datetime.datetime.now() - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
+                            hist = fyers.history({"symbol": sym, "resolution": "5", "date_format": "1", "range_from": r_from, "range_to": r_to, "cont_flag": "1"})
+                            
+                            if hist.get('s') == 'ok':
+                                df = pd.DataFrame(hist['candles'], columns=['t','o','h','l','c','v'])
+                                data = analyze_logic_main40(df, sym)
+                                # ONLY add to database if RR > 4
+                                if data and data['rr'] > 4:
+                                    conn.execute("""INSERT OR REPLACE INTO scanned_symbols 
+                                        (symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time, status) 
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'FOUND')""", 
+                                        (sym, data['ltp'], data['atl'], data['lh1'], data['fvg'], 
+                                         data['lh2'], data['sl'], data['rr'], data['atl_time']))
+                                    found_count += 1
+                conn.commit()
+                st.toast(f"Added {found_count} options with RR > 4!")
 
-    # MAIN CONTENT
     tab1, tab2 = st.tabs(["📊 Live Patterns", "🚀 Active Trades"])
     
     with tab1:
         st.subheader("Detected SMC Patterns")
-        df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn)
+        df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time FROM scanned_symbols WHERE status='FOUND' AND rr > 4 ORDER BY rr DESC", conn)
         st.dataframe(df, width='stretch')
 
     st_autorefresh(interval=60000, key="bot_refresh")
