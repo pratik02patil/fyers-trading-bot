@@ -19,7 +19,7 @@ def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
     try:
-        c.execute("SELECT atl_time FROM scanned_symbols LIMIT 1")
+        c.execute("SELECT lh1_broken FROM scanned_symbols LIMIT 1")
     except sqlite3.OperationalError:
         c.execute("DROP TABLE IF EXISTS scanned_symbols")
         c.execute('''CREATE TABLE scanned_symbols (
@@ -28,17 +28,21 @@ def init_db():
     conn.commit()
     return conn
 
-# --- REFINED LOGIC TO TRACK LH1 BREAK ---
+# --- REFRESHED LOGIC: STRICT main40.py FILTERS ---
 def analyze_logic_main40(df, sym):
     if df.empty or len(df) < 20: return None
     
+    # 1. Find ATL & Apply STRICT Price Filter (30-250)
     min_idx = df['l'].idxmin()
     atl_val = round(df['l'].iloc[min_idx], 2)
+    
+    # RESTORED: Exact price filter from main40.py
     if not (30 < atl_val < 250): return None
-    
+    if min_idx >= len(df) - 3: return None
+
     atl_ts = pd.to_datetime(df['t'].iloc[min_idx], unit='s') + datetime.timedelta(hours=5, minutes=30)
-    
-    # Peak Detection (LH1 & LH2)
+
+    # 2. Peak Detection (LH1 & LH2)
     search_start = max(0, min_idx - 300)
     pre_atl = df.iloc[search_start:min_idx].reset_index(drop=True)
     all_peaks = []
@@ -49,22 +53,33 @@ def analyze_logic_main40(df, sym):
             
     if not all_peaks: return None
     lh1 = all_peaks[0] 
-    lh2 = all_peaks[1] if len(all_peaks) > 1 else lh1 * 2
     
-    # FVG Calculation
+    lh2 = None
+    for p in all_peaks[1:]:
+        if p >= lh1 * 1.5:
+            lh2 = p
+            break
+    if lh2 is None and len(all_peaks) > 1: lh2 = all_peaks[1]
+    elif lh2 is None: return None 
+
+    # 3. FVG & SL
     fvg_entry = None
     post_atl_data = df.iloc[min_idx:].reset_index(drop=True)
     for i in range(len(post_atl_data)-2):
         if post_atl_data['l'].iloc[i+2] > post_atl_data['h'].iloc[i]:
             fvg_entry = (post_atl_data['l'].iloc[i+2] + post_atl_data['h'].iloc[i]) / 2
             break
-    if not fvg_entry: fvg_entry = atl_val * 1.05
     
+    if not fvg_entry: fvg_entry = atl_val * 1.05
     sl_val = round(atl_val - (atl_val * 0.02), 1)
+    
+    # 4. RR Filter (RR > 4)
+    if fvg_entry <= sl_val: return None
     rr = round((lh2 - fvg_entry)/(fvg_entry - sl_val), 2)
     if rr <= 4: return None
 
-    # NEW: Check if LH1 was broken at any point after ATL
+    # 5. Tracking LH1 Breakout for Watchlist/Active categorisation
+    # Checks if any candle high post-ATL exceeded LH1
     lh1_broken = 1 if post_atl_data['h'].max() > lh1 else 0
 
     return {
@@ -74,7 +89,7 @@ def analyze_logic_main40(df, sym):
         "lh1_broken": lh1_broken
     }
 
-# --- BACKGROUND SCANNER ---
+# --- BACKGROUND ENGINE ---
 def run_scanner():
     while True:
         try:
@@ -82,6 +97,7 @@ def run_scanner():
             if os.path.exists(TOKEN_FILE):
                 with open(TOKEN_FILE, "r") as f: token = f.read().strip()
                 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token, is_async=False)
+                
                 symbols = pd.read_sql("SELECT symbol FROM scanned_symbols", worker_conn)['symbol'].tolist()
                 for sym in symbols:
                     r_to = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -110,7 +126,6 @@ def main():
         threading.Thread(target=run_scanner, daemon=True).start()
         st.session_state['bg_active'] = True
 
-    # Sidebar Login logic remains same...
     st.sidebar.title("Login & Controls")
     if not os.path.exists(TOKEN_FILE):
         session = fyersModel.SessionModel(client_id=CLIENT_ID, secret_key=SECRET_KEY, redirect_uri=REDIRECT_URI, response_type="code", grant_type="authorization_code")
@@ -126,31 +141,32 @@ def main():
         if st.sidebar.button("Fetch High RR Options", width='stretch'):
             token = open(TOKEN_FILE, "r").read().strip()
             fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token)
+            # Fetching 30 strikes as per main40.py
             for idx in ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"]:
-                oc = fyers.optionchain({"symbol": idx, "strikecount": 7}) 
+                oc = fyers.optionchain({"symbol": idx, "strikecount": 30}) 
                 if oc.get('s') == 'ok':
                     for opt in oc['data']['optionsChain']:
                         conn.execute("INSERT OR IGNORE INTO scanned_symbols (symbol, status) VALUES (?, 'WATCHING')", (opt['symbol'],))
             conn.commit()
+            st.toast("Seeded 120 options for scanning!")
 
-    # --- TABS: ALIGNED WITH YOUR TRADING FLOW ---
     tab1, tab_watchlist, tab2 = st.tabs(["📊 Live Patterns", "🔭 Watchlist", "🚀 Active Trades"])
     
     with tab1:
-        st.subheader("All Scanned Patterns")
+        st.subheader("All Scanned Patterns (Strict Price Filter)")
         full_df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time, lh1_broken FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn)
         st.dataframe(full_df, width='stretch')
 
     with tab_watchlist:
-        st.subheader("Waiting for Retracement (LH1 Broken, LTP > FVG)")
-        # 26400 PE Logic: LH1 is broken, but LTP is still higher than FVG (Waiting for dip)
-        watchlist_df = full_df[(full_df['lh1_broken'] == 1) & (full_df['ltp'] > full_df['fvg'])]
+        st.subheader("Watchlist: Breakout Waiting for Retracement")
+        # LH1 is broken, but price is still above the entry zone
+        watchlist_df = full_df[(full_df['lh1_broken'] == 1) & (full_df['ltp'] > full_df['fvg'] * 1.02)]
         st.dataframe(watchlist_df, width='stretch')
 
     with tab2:
-        st.subheader("Active Trades (Retracement Complete, LTP near/at FVG)")
-        # 26300 PE Logic: LH1 is broken, and LTP has retraced to FVG level
-        active_df = full_df[(full_df['lh1_broken'] == 1) & (full_df['ltp'] <= (full_df['fvg'] * 1.02)) & (full_df['ltp'] >= full_df['sl'])]
+        st.subheader("Active Trades: Entry Criteria Met")
+        # LH1 is broken and price has retraced to FVG/SL zone
+        active_df = full_df[(full_df['lh1_broken'] == 1) & (full_df['ltp'] <= full_df['fvg'] * 1.02) & (full_df['ltp'] >= full_df['sl'])]
         st.dataframe(active_df, width='stretch')
 
     st_autorefresh(interval=60000, key="bot_refresh")
