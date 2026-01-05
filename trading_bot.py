@@ -5,49 +5,30 @@ import time
 import threading
 import datetime
 import os
-import json
-import hashlib
 from fyers_apiv3 import fyersModel
 from streamlit_autorefresh import st_autorefresh
 
-# --- CONFIG & LOCAL STORAGE ---
+# --- CONFIG & SECRETS ---
+CLIENT_ID = st.secrets["fyers"]["client_id"]
+SECRET_KEY = st.secrets["fyers"]["secret_key"]
+REDIRECT_URI = "https://www.google.com/"
+TOKEN_FILE = "access_token.txt"
 DB_FILE = "trading_bot.db"
-USER_CONFIG_FILE = "user_configs.json"
-
-def load_user_configs():
-    if os.path.exists(USER_CONFIG_FILE):
-        with open(USER_CONFIG_FILE, "r") as f:
-            try: return json.load(f)
-            except: return {}
-    return {}
-
-def save_user_callback():
-    app_id = st.session_state.get("new_app_id")
-    secret = st.session_state.get("new_secret")
-    if app_id and secret:
-        configs = load_user_configs()
-        configs[app_id] = secret
-        with open(USER_CONFIG_FILE, "w") as f:
-            json.dump(configs, f)
-        st.session_state["account_choice"] = app_id
-        st.toast(f"Account {app_id} saved!")
 
 def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
-    # FORCE RECREATION IF SCHEMA IS OLD
     try:
-        c.execute("SELECT user_hash FROM scanned_symbols LIMIT 1")
+        c.execute("SELECT atl_time FROM scanned_symbols LIMIT 1")
     except sqlite3.OperationalError:
         c.execute("DROP TABLE IF EXISTS scanned_symbols")
         c.execute('''CREATE TABLE scanned_symbols (
-                        user_hash TEXT, symbol TEXT, ltp REAL, atl REAL, lh1 REAL, fvg REAL, lh2 REAL, 
-                        sl REAL, rr REAL, atl_time TEXT, status TEXT,
-                        PRIMARY KEY (user_hash, symbol))''')
+                        symbol TEXT PRIMARY KEY, ltp REAL, atl REAL, lh1 REAL, fvg REAL, lh2 REAL, 
+                        sl REAL, rr REAL, atl_time TEXT, status TEXT)''')
     conn.commit()
     return conn
 
-# --- CORE TRADING BOT LOGIC (UNTOUCHED) ---
+# --- LOGIC RETAINED FROM PREVIOUS ITERATION ---
 def analyze_logic_main40(df, sym):
     if df.empty or len(df) < 20: return None
     min_idx = df['l'].idxmin()
@@ -64,14 +45,14 @@ def analyze_logic_main40(df, sym):
         if curr_h > pre_atl['h'].iloc[i-1] and curr_h > pre_atl['h'].iloc[i+1]:
             all_peaks.append(curr_h)
     if not all_peaks: return None
-    lh1 = all_peaks[0]
+    lh1 = all_peaks[0] 
     lh2 = None
     for p in all_peaks[1:]:
         if p >= lh1 * 1.5:
             lh2 = p
             break
     if lh2 is None and len(all_peaks) > 1: lh2 = all_peaks[1]
-    elif lh2 is None: return None
+    elif lh2 is None: return None 
     fvg_entry = None
     post_atl_data = df.iloc[min_idx:].reset_index(drop=True)
     for i in range(len(post_atl_data)-2):
@@ -89,89 +70,87 @@ def analyze_logic_main40(df, sym):
         "sl": round(float(sl_val), 1), "rr": round(float(rr), 1), "atl_time": atl_ts.strftime("%H:%M:%S")
     }
 
-def run_user_scanner(user_hash, app_id, token):
+def run_scanner():
     while True:
         try:
             worker_conn = sqlite3.connect(DB_FILE)
-            fyers = fyersModel.FyersModel(client_id=app_id, token=token, is_async=False)
-            symbols_df = pd.read_sql("SELECT symbol FROM scanned_symbols WHERE user_hash=?", worker_conn, params=(user_hash,))
-            for sym in symbols_df['symbol'].tolist():
-                r_to = datetime.datetime.now().strftime("%Y-%m-%d")
-                r_from = (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
-                res = fyers.history({"symbol": sym, "resolution": "15", "date_format": "1", "range_from": r_from, "range_to": r_to, "cont_flag": "1"})
-                if res.get('s') == 'ok':
-                    df = pd.DataFrame(res['candles'], columns=['t','o','h','l','c','v'])
-                    data = analyze_logic_main40(df, sym)
-                    if data:
-                        worker_conn.execute("""UPDATE scanned_symbols SET ltp=?, atl=?, lh1=?, fvg=?, lh2=?, sl=?, rr=?, atl_time=?, status='FOUND' 
-                                            WHERE symbol=? AND user_hash=?""", (data['ltp'], data['atl'], data['lh1'], data['fvg'], 
-                                                                             data['lh2'], data['sl'], data['rr'], data['atl_time'], sym, user_hash))
-            worker_conn.commit()
+            if os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, "r") as f: token = f.read().strip()
+                fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token, is_async=False)
+                symbols = pd.read_sql("SELECT symbol FROM scanned_symbols", worker_conn)['symbol'].tolist()
+                for sym in symbols:
+                    r_to = datetime.datetime.now().strftime("%Y-%m-%d")
+                    r_from = (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
+                    res = fyers.history({"symbol": sym, "resolution": "15", "date_format": "1", "range_from": r_from, "range_to": r_to, "cont_flag": "1"})
+                    if res.get('s') == 'ok':
+                        df = pd.DataFrame(res['candles'], columns=['t','o','h','l','c','v'])
+                        data = analyze_logic_main40(df, sym)
+                        if data:
+                            worker_conn.execute("""UPDATE scanned_symbols SET ltp=?, atl=?, lh1=?, fvg=?, lh2=?, sl=?, rr=?, atl_time=?, status='FOUND' WHERE symbol=?""", (data['ltp'], data['atl'], data['lh1'], data['fvg'], data['lh2'], data['sl'], data['rr'], data['atl_time'], sym))
+                worker_conn.commit()
             worker_conn.close()
-        except Exception as e:
-            print(f"Scanner Error: {e}")
+        except: pass
         time.sleep(300)
 
+# --- UI INTERFACE ---
 def main():
-    st.set_page_config(page_title="SMC Multi-User Bot", layout="wide")
+    st.set_page_config(page_title="SMC Pro Bot", layout="wide")
     conn = init_db()
-    
-    st.sidebar.title("🔐 Multi-User Login")
-    saved_configs = load_user_configs()
-    app_ids = list(saved_configs.keys())
-    
-    choice = st.sidebar.selectbox("Select Account", ["New Login"] + app_ids, key="account_choice")
-    
-    if choice == "New Login":
-        st.sidebar.text_input("Enter App ID", key="new_app_id")
-        st.sidebar.text_input("Enter Secret Key", type="password", key="new_secret")
-        st.sidebar.button("Save & Use", on_click=save_user_callback)
-        st.info("Setup your Fyers App in the sidebar.")
-        return
-    else:
-        u_app_id = choice
-        u_secret = saved_configs[choice]
-        user_hash = hashlib.md5(u_app_id.encode()).hexdigest()
+    if 'bg_active' not in st.session_state:
+        threading.Thread(target=run_scanner, daemon=True).start()
+        st.session_state['bg_active'] = True
 
-    if f'token_{user_hash}' not in st.session_state:
-        session = fyersModel.SessionModel(client_id=u_app_id, secret_key=u_secret, redirect_uri="https://www.google.com/", response_type="code", grant_type="authorization_code")
+    st.sidebar.title("Login & Controls")
+    if not os.path.exists(TOKEN_FILE):
+        session = fyersModel.SessionModel(client_id=CLIENT_ID, secret_key=SECRET_KEY, redirect_uri=REDIRECT_URI, response_type="code", grant_type="authorization_code")
         st.sidebar.markdown(f"[Authorize App]({session.generate_authcode()})")
-        auth_code = st.sidebar.text_input("Enter Auth Code:", key=f"auth_{user_hash}")
-        if st.sidebar.button("Login"):
+        auth_code = st.sidebar.text_input("Enter Code:")
+        if st.sidebar.button("Save Token"):
             session.set_token(auth_code)
             res = session.generate_token()
-            if "access_token" in res:
-                st.session_state[f'token_{user_hash}'] = res["access_token"]
-                st.rerun()
+            with open(TOKEN_FILE, "w") as f: f.write(res["access_token"])
+            st.rerun()
     else:
-        st.sidebar.success(f"User: {u_app_id} ✅")
-        token = st.session_state[f'token_{user_hash}']
-        
-        if f'bg_{user_hash}' not in st.session_state:
-            t = threading.Thread(target=run_user_scanner, args=(user_hash, u_app_id, token), daemon=True)
-            t.start()
-            st.session_state[f'bg_{user_hash}'] = True
-
-        if st.sidebar.button("Fetch Options"):
-            fyers = fyersModel.FyersModel(client_id=u_app_id, token=token)
-            for idx in ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX"]:
-                oc = fyers.optionchain({"symbol": idx, "strikecount": 15})
+        st.sidebar.success("Fyers API Active ✅")
+        if st.sidebar.button("Fetch High RR Options", width='stretch'):
+            token = open(TOKEN_FILE, "r").read().strip()
+            fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token)
+            for idx in ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"]:
+                oc = fyers.optionchain({"symbol": idx, "strikecount": 7}) 
                 if oc.get('s') == 'ok':
                     for opt in oc['data']['optionsChain']:
-                        conn.execute("INSERT OR IGNORE INTO scanned_symbols (user_hash, symbol, status) VALUES (?, ?, 'WATCHING')", (user_hash, opt['symbol']))
+                        sym = opt['symbol']
+                        hist = fyers.history({"symbol": sym, "resolution": "15", "date_format": "1", "range_from": (datetime.datetime.now() - datetime.timedelta(days=14)).strftime("%Y-%m-%d"), "range_to": datetime.datetime.now().strftime("%Y-%m-%d"), "cont_flag": "1"})
+                        if hist.get('s') == 'ok':
+                            df = pd.DataFrame(hist['candles'], columns=['t','o','h','l','c','v'])
+                            data = analyze_logic_main40(df, sym)
+                            if data:
+                                conn.execute("INSERT OR REPLACE INTO scanned_symbols (symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'FOUND')", (sym, data['ltp'], data['atl'], data['lh1'], data['fvg'], data['lh2'], data['sl'], data['rr'], data['atl_time']))
             conn.commit()
-            st.toast("Seeded 90+ options. Scanner is working...")
 
-        tab1, tab_watchlist, tab2 = st.tabs(["📊 Live Patterns", "🔭 Watchlist", "🚀 Active Trades"])
-        
-        with tab1:
-            full_df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time FROM scanned_symbols WHERE status='FOUND' AND user_hash=? ORDER BY rr DESC", conn, params=(user_hash,))
-            st.dataframe(full_df, use_container_width=True)
+    # --- UPDATED TABS ---
+    tab1, tab_watchlist, tab2 = st.tabs(["📊 Live Patterns", "🔭 Watchlist", "🚀 Active Trades"])
+    
+    # 1. LIVE PATTERNS TAB
+    with tab1:
+        st.subheader("All Scanned Patterns")
+        full_df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn)
+        st.dataframe(full_df, width='stretch')
 
-        with tab_watchlist:
-            if not full_df.empty:
-                watchlist_df = full_df[(full_df['ltp'] >= full_df['lh1']) & (full_df['ltp'] <= (full_df['fvg'] * 1.01)) & (full_df['ltp'] >= full_df['sl'])]
-                st.dataframe(watchlist_df, use_container_width=True)
+    # 2. WATCHLIST TAB (LH1 Break + FVG Retracement)
+    with tab_watchlist:
+        st.subheader("LH1 Break & Retracing into FVG")
+        # Filters: LTP > LH1 (Breakout) and LTP is near FVG (Retracement)
+        # We check if LTP is between SL and FVG + a small buffer for the retracement entry
+        watchlist_df = full_df[
+            (full_df['ltp'] >= full_df['lh1']) & 
+            (full_df['ltp'] <= (full_df['fvg'] * 1.01)) & 
+            (full_df['ltp'] >= full_df['sl'])
+        ]
+        if watchlist_df.empty:
+            st.info("No symbols currently breaking LH1 and retracing to FVG.")
+        else:
+            st.dataframe(watchlist_df, width='stretch')
 
     st_autorefresh(interval=60000, key="bot_refresh")
     conn.close()
