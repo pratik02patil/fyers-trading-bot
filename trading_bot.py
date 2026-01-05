@@ -22,7 +22,6 @@ def load_user_configs():
     return {}
 
 def save_user_callback():
-    """Saves credentials and automatically switches the UI to the new account."""
     app_id = st.session_state.get("new_app_id")
     secret = st.session_state.get("new_secret")
     if app_id and secret:
@@ -30,14 +29,13 @@ def save_user_callback():
         configs[app_id] = secret
         with open(USER_CONFIG_FILE, "w") as f:
             json.dump(configs, f)
-        # Force the selectbox to switch to the newly saved ID
         st.session_state["account_choice"] = app_id
-        st.toast(f"Account {app_id} saved successfully!")
+        st.toast(f"Account {app_id} saved!")
 
 def init_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
-    # Check if user_hash exists to handle multi-user isolation
+    # FORCE RECREATION IF SCHEMA IS OLD
     try:
         c.execute("SELECT user_hash FROM scanned_symbols LIMIT 1")
     except sqlite3.OperationalError:
@@ -49,7 +47,7 @@ def init_db():
     conn.commit()
     return conn
 
-# --- CORE LOGIC (Exactly as per your original file) ---
+# --- CORE TRADING BOT LOGIC (UNTOUCHED) ---
 def analyze_logic_main40(df, sym):
     if df.empty or len(df) < 20: return None
     min_idx = df['l'].idxmin()
@@ -110,73 +108,68 @@ def run_user_scanner(user_hash, app_id, token):
                                                                              data['lh2'], data['sl'], data['rr'], data['atl_time'], sym, user_hash))
             worker_conn.commit()
             worker_conn.close()
-        except: pass
+        except Exception as e:
+            print(f"Scanner Error: {e}")
         time.sleep(300)
 
 def main():
     st.set_page_config(page_title="SMC Multi-User Bot", layout="wide")
     conn = init_db()
     
-    st.sidebar.title("🔐 Account Manager")
+    st.sidebar.title("🔐 Multi-User Login")
     saved_configs = load_user_configs()
     app_ids = list(saved_configs.keys())
     
-    # Using session_state for the selectbox key to allow code-driven switching
     choice = st.sidebar.selectbox("Select Account", ["New Login"] + app_ids, key="account_choice")
     
     if choice == "New Login":
-        st.sidebar.subheader("Register New App")
-        st.sidebar.text_input("Fyers App ID", key="new_app_id")
-        st.sidebar.text_input("Fyers Secret Key", type="password", key="new_secret")
-        st.sidebar.button("💾 Save & Use", on_click=save_user_callback)
-        st.info("Please enter your Fyers credentials in the sidebar to start.")
+        st.sidebar.text_input("Enter App ID", key="new_app_id")
+        st.sidebar.text_input("Enter Secret Key", type="password", key="new_secret")
+        st.sidebar.button("Save & Use", on_click=save_user_callback)
+        st.info("Setup your Fyers App in the sidebar.")
         return
     else:
         u_app_id = choice
         u_secret = saved_configs[choice]
         user_hash = hashlib.md5(u_app_id.encode()).hexdigest()
 
-    # --- AUTHENTICATION ---
     if f'token_{user_hash}' not in st.session_state:
         session = fyersModel.SessionModel(client_id=u_app_id, secret_key=u_secret, redirect_uri="https://www.google.com/", response_type="code", grant_type="authorization_code")
-        st.sidebar.markdown(f"**[Click here to get Auth Code]({session.generate_authcode()})**")
-        auth_code = st.sidebar.text_input("Paste Auth Code Here:", key=f"auth_{user_hash}")
-        if st.sidebar.button("🔗 Login to Fyers"):
+        st.sidebar.markdown(f"[Authorize App]({session.generate_authcode()})")
+        auth_code = st.sidebar.text_input("Enter Auth Code:", key=f"auth_{user_hash}")
+        if st.sidebar.button("Login"):
             session.set_token(auth_code)
             res = session.generate_token()
             if "access_token" in res:
                 st.session_state[f'token_{user_hash}'] = res["access_token"]
                 st.rerun()
     else:
-        st.sidebar.success(f"Connected: {u_app_id}")
+        st.sidebar.success(f"User: {u_app_id} ✅")
         token = st.session_state[f'token_{user_hash}']
         
         if f'bg_{user_hash}' not in st.session_state:
-            threading.Thread(target=run_user_scanner, args=(user_hash, u_app_id, token), daemon=True).start()
+            t = threading.Thread(target=run_user_scanner, args=(user_hash, u_app_id, token), daemon=True)
+            t.start()
             st.session_state[f'bg_{user_hash}'] = True
 
-        if st.sidebar.button("🚀 Fetch Option Chain"):
+        if st.sidebar.button("Fetch Options"):
             fyers = fyersModel.FyersModel(client_id=u_app_id, token=token)
             for idx in ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX"]:
-                oc = fyers.optionchain({"symbol": idx, "strikecount": 10})
+                oc = fyers.optionchain({"symbol": idx, "strikecount": 15})
                 if oc.get('s') == 'ok':
                     for opt in oc['data']['optionsChain']:
                         conn.execute("INSERT OR IGNORE INTO scanned_symbols (user_hash, symbol, status) VALUES (?, ?, 'WATCHING')", (user_hash, opt['symbol']))
             conn.commit()
-            st.toast("Symbols added to scanner.")
+            st.toast("Seeded 90+ options. Scanner is working...")
 
-        # --- TABS ---
         tab1, tab_watchlist, tab2 = st.tabs(["📊 Live Patterns", "🔭 Watchlist", "🚀 Active Trades"])
         
         with tab1:
-            st.subheader("Detected SMC Patterns")
             full_df = pd.read_sql("SELECT symbol, ltp, atl, lh1, fvg, lh2, sl, rr, atl_time FROM scanned_symbols WHERE status='FOUND' AND user_hash=? ORDER BY rr DESC", conn, params=(user_hash,))
             st.dataframe(full_df, use_container_width=True)
 
         with tab_watchlist:
-            st.subheader("LH1 Break & Retracing")
             if not full_df.empty:
-                # Exact logic from your original trading_bot.py
                 watchlist_df = full_df[(full_df['ltp'] >= full_df['lh1']) & (full_df['ltp'] <= (full_df['fvg'] * 1.01)) & (full_df['ltp'] >= full_df['sl'])]
                 st.dataframe(watchlist_df, use_container_width=True)
 
