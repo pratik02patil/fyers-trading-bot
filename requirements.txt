@@ -1,0 +1,5 @@
+streamlit
+pandas
+fyers-apiv3
+pytz
+streamlit-autorefresh
