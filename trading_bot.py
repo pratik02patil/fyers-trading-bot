@@ -9,7 +9,7 @@ import os
 from fyers_apiv3 import fyersModel
 from streamlit_autorefresh import st_autorefresh
 
-# --- CONFIG & SECRETS (UNCHANGED) ---
+# --- CONFIG & SECRETS ---
 CLIENT_ID = st.secrets["fyers"]["client_id"]
 SECRET_KEY = st.secrets["fyers"]["secret_key"]
 REDIRECT_URI = "https://www.google.com/"
@@ -39,6 +39,7 @@ def get_lot_size(symbol):
     if "SENSEX" in symbol.upper(): return 20
     return 1
 
+# --- CORE LOGIC (UNCHANGED) ---
 def analyze_logic_main40(df, sym):
     if df.empty or len(df) < 20: return None
     min_idx = df['l'].idxmin()
@@ -120,25 +121,16 @@ def main():
             token = open(TOKEN_FILE).read().strip()
             fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=token)
             
-            # --- PROGRESS BAR SETUP ---
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            indices = ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"]
-            total_steps = len(indices) * 3  # 2 indices * 3 expiries
-            current_step = 0
-
-            for idx in indices:
+            # UPDATED: Loop through Nifty and Sensex for multiple expiries
+            for idx in ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"]:
+                # Fetching the option chain to get all expiry dates first
                 oc_info = fyers.optionchain({"symbol": idx, "strikecount": 1})
                 if oc_info.get('s') == 'ok':
+                    # Get the list of all expiries and take the first 3
                     all_expiries = oc_info['data']['expiryData']
                     target_expiries = [e['expiry'] for e in all_expiries[:3]]
                     
                     for exp_date in target_expiries:
-                        current_step += 1
-                        progress_val = int((current_step / total_steps) * 100)
-                        progress_bar.progress(progress_val)
-                        status_text.info(f"Scanning {idx} for Expiry: {exp_date}...")
-                        
                         oc = fyers.optionchain({"symbol": idx, "strikecount": 7, "expiry": exp_date})
                         if oc.get('s') == 'ok':
                             for opt in oc['data']['optionsChain']:
@@ -155,11 +147,6 @@ def main():
                                                                ON CONFLICT (symbol) DO UPDATE SET ltp=EXCLUDED.ltp, rr=EXCLUDED.rr""", 
                                                             (sym, data['ltp'], data['atl'], data['lh1'], data['fvg'], data['lh2'], data['sl'], data['rr'], data['atl_time']))
                                             conn.commit()
-            
-            status_text.success("Scan Complete for 3 Expiries!")
-            time.sleep(2)
-            status_text.empty()
-            progress_bar.empty()
 
     tab1, tab_watchlist, tab2, tab_history = st.tabs(["📊 Live Patterns", "🔭 Watchlist", "🚀 Active Trades", "📜 History"])
     
