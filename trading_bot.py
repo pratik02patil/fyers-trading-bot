@@ -16,6 +16,14 @@ REDIRECT_URI = "https://www.google.com/"
 TOKEN_FILE = "access_token.txt"
 DB_URI = st.secrets["postgres"]["uri"] 
 
+# HELPER TO FIX THE WARNINGS
+def safe_read_sql(query, conn):
+    """Reads SQL query into DataFrame without DBAPI2 warnings."""
+    with conn.cursor() as cur:
+        cur.execute(query)
+        columns = [desc[0] for desc in cur.description]
+        return pd.DataFrame(cur.fetchall(), columns=columns)
+
 def init_db():
     try:
         conn = psycopg2.connect(DB_URI)
@@ -39,6 +47,7 @@ def get_lot_size(symbol):
     if "SENSEX" in symbol.upper(): return 20
     return 1
 
+# --- CORE LOGIC (UNCHANGED) ---
 def analyze_logic_main40(df, sym):
     if df.empty or len(df) < 20: return None
     min_idx = df['l'].idxmin()
@@ -165,22 +174,25 @@ def main():
     with psycopg2.connect(DB_URI) as conn:
         with tab1:
             st.subheader("All Scanned Patterns (3 Expiries)")
-            # Fix: Added width='stretch' and using conn directly
-            st.dataframe(pd.read_sql("SELECT * FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn), width='stretch')
+            # UPDATED: Using safe_read_sql to stop warnings
+            st.dataframe(safe_read_sql("SELECT * FROM scanned_symbols WHERE status='FOUND' ORDER BY rr DESC", conn), width='stretch')
 
         with tab_watchlist:
             st.subheader("LH1 Break & Retracing into FVG")
-            full_df = pd.read_sql("SELECT * FROM scanned_symbols WHERE status='FOUND'", conn)
-            valid = full_df[(full_df['ltp'] >= full_df['lh1']) & (full_df['ltp'] <= (full_df['fvg'] * 1.01)) & (full_df['ltp'] >= full_df['sl'])]
-            st.dataframe(valid, width='stretch')
+            full_df = safe_read_sql("SELECT * FROM scanned_symbols WHERE status='FOUND'", conn)
+            if not full_df.empty:
+                valid = full_df[(full_df['ltp'] >= full_df['lh1']) & (full_df['ltp'] <= (full_df['fvg'] * 1.01)) & (full_df['ltp'] >= full_df['sl'])]
+                st.dataframe(valid, width='stretch')
+            else:
+                st.info("No patterns found yet.")
 
         with tab2:
             st.subheader("Currently Monitored Trades")
-            st.dataframe(pd.read_sql("SELECT * FROM active_trades", conn), width='stretch')
+            st.dataframe(safe_read_sql("SELECT * FROM active_trades", conn), width='stretch')
 
         with tab_history:
             st.subheader("Completed Trade Performance")
-            st.dataframe(pd.read_sql("SELECT * FROM trade_history ORDER BY time DESC", conn), width='stretch')
+            st.dataframe(safe_read_sql("SELECT * FROM trade_history ORDER BY time DESC", conn), width='stretch')
 
     st_autorefresh(interval=10000, key="ui_refresh")
 
