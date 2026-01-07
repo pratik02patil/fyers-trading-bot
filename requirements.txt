@@ -7,4 +7,3 @@ psycopg2-binary
 SQLAlchemy
 requests
 urllib3
-
