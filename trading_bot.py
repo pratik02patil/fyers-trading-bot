@@ -15,7 +15,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Institutional Pro Scanner", layout="wide")
-st.title("📈 Institutional Pro - Streamlit Edition")
+st.title("📈 TradeBot - Streamlit Edition")
 
 # --- INITIALIZE GLOBAL STATE ---
 # We store market_data and history_data in st.session_state so they survive reruns
@@ -111,3 +111,4 @@ if st.button("Manual Scan Now"):
     run_scanner()
 
 st.caption(f"Last Updated: {datetime.datetime.now().strftime('%H:%M:%S')}")
+
